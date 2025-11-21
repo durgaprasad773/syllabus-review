@@ -1,95 +1,184 @@
 import streamlit as st
 import pandas as pd
-from sentence_transformers import SentenceTransformer
-import openai
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import io
+import re
 
-st.set_page_config(page_title="MCQ Reviewer App", layout="wide")
-st.title("MCQ Reviewer with OpenAI & BGE Local Similarity")
+from sentence_transformers import SentenceTransformer, util
 
-# --- Input Section ---
-openai_api_key = st.text_input("Enter your OpenAI API Key", type="password")
-uploaded_file = st.file_uploader("Upload MCQ CSV (must have 'Question' column)", type=["csv"])
-bulk_master = st.text_area("Bulk Master Questions (one per line)")
-syllabus_text = st.text_area("Syllabus Content")
+# ==============================
+# Load free embedding model
+# ==============================
+@st.cache_resource
+def load_model():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-if st.button("Run Review") and uploaded_file and openai_api_key and bulk_master and syllabus_text:
-    df = pd.read_csv(uploaded_file)
-    if "Question" not in df.columns:
-        st.error("'Question' column not found in the uploaded CSV.")
+model = load_model()
+
+# ==============================
+# Utility functions
+# ==============================
+def read_excel(file):
+    try:
+        return pd.read_excel(file)
+    except:
+        return None
+
+
+def embed_text_list(text_list):
+    text_list = ["" if pd.isna(t) else str(t) for t in text_list]
+    return model.encode(text_list, convert_to_tensor=True, show_progress_bar=False)
+
+
+def fix_quotes(text: str):
+    """Convert 'word' → `word` while avoiding contractions."""
+    if pd.isna(text):
+        return text
+
+    def repl(match):
+        inner = match.group(1)
+        return f"`{inner}`"
+
+    return re.sub(r"'([A-Za-z0-9_+-]+)'", repl, str(text))
+
+
+# ==============================
+# Streamlit UI
+# ==============================
+st.set_page_config(page_title="MCQ Review Tool (Free Embeddings)", layout="wide")
+
+st.title("MCQ Review & Clean Tool (Open Source Embeddings — No Token Use)")
+
+# Upload files
+generated_file = st.file_uploader("Upload Generated MCQ Excel", type=["xlsx"])
+master_file = st.file_uploader("Upload Master Questions Excel", type=["xlsx"])
+
+st.markdown("---")
+
+syllabus_text = st.text_area("Paste Syllabus (Optional)", height=200)
+
+fix_quotes_toggle = st.checkbox("Convert 'break' → `break`", value=True)
+
+sim_threshold = st.slider("Duplicate Detection Threshold", 0.50, 0.95, 0.75)
+syllabus_threshold = st.slider("Syllabus Relevance Threshold", 0.30, 0.95, 0.55)
+
+run_btn = st.button("Run Cleaning")
+
+# ==============================
+# MAIN PROCESSING
+# ==============================
+if run_btn:
+
+    if generated_file is None:
+        st.error("Please upload the Generated MCQ Excel first.")
         st.stop()
 
-    # --- Step 1: Similarity/Duplicates Removal ---
-    st.write("Loading BGE-M3 embedding model, please wait...")
-    model = SentenceTransformer("BAAI/bge-m3")  # This downloads and caches model locally
+    # Load generated questions
+    gen_df = read_excel(generated_file)
+    if gen_df is None:
+        st.error("Could not read generated MCQ file.")
+        st.stop()
 
-    sheet_questions = df["Question"].astype(str).tolist()
-    master_questions = [q.strip() for q in bulk_master.split("\n") if q.strip()]
-    master_embeddings = model.encode(master_questions, batch_size=64, normalize_embeddings=True)
-    sheet_embeddings = model.encode(sheet_questions, batch_size=64, normalize_embeddings=True)
-    similarity = cosine_similarity(sheet_embeddings, master_embeddings)
-    sim_threshold = 0.75
+    st.success("Generated MCQ file loaded successfully.")
+    st.write(gen_df.head())
 
-    dup_indices = []
-    dup_details = []
-    for idx, sim_scores in enumerate(similarity):
-        max_sim = max(sim_scores)
-        match_idx = sim_scores.argmax()
-        if max_sim >= sim_threshold:
-            dup_indices.append(idx)
-            dup_details.append({
-                "Sheet Question": sheet_questions[idx],
-                "Matched Master": master_questions[match_idx],
-                "Similarity": f"{max_sim:.2f}"
-            })
+    # Load master questions
+    master_df = None
+    if master_file:
+        master_df = read_excel(master_file)
+        st.success("Master file loaded.")
+        st.write(master_df.head())
 
-    df_nodup = df.drop(index=dup_indices).reset_index(drop=True)
-    st.subheader(f"Duplicates Removed ({len(dup_indices)})")
-    st.dataframe(pd.DataFrame(dup_details))
+    # Detect question column
+    q_col = None
+    for col in gen_df.columns:
+        if "question" in col.lower():
+            q_col = col
+            break
+    if q_col is None:
+        q_col = gen_df.columns[0]
 
-    # --- Step 2: Syllabus Validation via OpenAI ---
-    def check_in_syllabus(question, syllabus, openai_key):
-        prompt = f"Is the following question within the syllabus? Return only Yes or No.\n\nSyllabus:\n{syllabus}\n\nQuestion:\n{question}"
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2,
-                api_key=openai_key,
-            )
-            return "yes" in response.choices[0].message['content'].strip().lower()
-        except Exception as e:
-            return False
+    st.info(f"Detected question column: **{q_col}**")
 
-    out_indices = []
-    out_details = []
-    st.write("Checking syllabus alignment, may take a few seconds per question...")
-    for i, row in df_nodup.iterrows():
-        q_text = str(row["Question"])
-        if not check_in_syllabus(q_text, syllabus_text, openai_api_key):
-            out_indices.append(i)
-            out_details.append({"Out-of-Syllabus Question": q_text})
+    # Apply quote fix
+    if fix_quotes_toggle:
+        for col in gen_df.columns:
+            if gen_df[col].dtype == object:
+                gen_df[col] = gen_df[col].apply(fix_quotes)
+        st.info("Quotes fixed across text columns.")
 
-    df_final = df_nodup.drop(index=out_indices).reset_index(drop=True)
-    st.subheader(f"Out-of-Syllabus Questions Removed ({len(out_indices)})")
-    st.dataframe(pd.DataFrame(out_details))
+    # ==============================
+    # Embedding Computation
+    # ==============================
+    questions = gen_df[q_col].astype(str).tolist()
+    st.info("Embedding generated questions...")
+    gen_embeds = embed_text_list(questions)
 
-    # --- Step 3: Normalize Quotes ---
-    def normalize_quotes(text):
-        return str(text).replace("''", "`")
+    remove_mask = np.zeros(len(gen_df), dtype=bool)
 
-    for col in ['Question', 'OptionA', 'OptionB', 'OptionC', 'OptionD', 'explanation']:
-        if col in df_final.columns:
-            df_final[col] = df_final[col].apply(normalize_quotes)
+    # ==============================
+    # 1️⃣ Master Similarity Filtering
+    # ==============================
+    if master_df is not None:
+        m_col = None
+        for col in master_df.columns:
+            if "question" in col.lower():
+                m_col = col
+                break
+        if m_col is None:
+            m_col = master_df.columns[0]
 
-    st.subheader(f"Final Cleaned MCQ Sheet ({df_final.shape[0]} questions remaining)")
-    st.dataframe(df_final)
+        master_qs = master_df[m_col].astype(str).tolist()
 
-    csv = df_final.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Final CSV", csv, file_name="MCQ_cleaned.csv")
+        st.info("Embedding master questions...")
+        master_embeds = embed_text_list(master_qs)
 
-    # --- Stats Summary ---
-    st.write(f"**Summary:**\n- {len(dup_indices)} duplicates removed\n- {len(out_indices)} out-of-syllabus removed\n- {df_final.shape[0]} questions remaining")
+        st.info("Comparing with master questions...")
+        sim_matrix = util.cos_sim(gen_embeds, master_embeds)
 
-else:
-    st.info("Upload a CSV, enter your OpenAI key, paste master questions and syllabus, then click 'Run Review'.")
+        max_similarities = sim_matrix.max(dim=1).values.cpu().numpy()
+
+        duplicates = max_similarities >= sim_threshold
+        remove_mask = remove_mask | duplicates
+
+        st.success(f"Duplicate questions found & removed: {duplicates.sum()}")
+
+    # ==============================
+    # 2️⃣ Syllabus Filtering
+    # ==============================
+    if syllabus_text.strip():
+        st.info("Checking syllabus relevance...")
+
+        syllabus_emb = embed_text_list([syllabus_text])[0]
+
+        sims = util.cos_sim(gen_embeds, syllabus_emb).cpu().numpy()
+
+        outside_syllabus = sims < syllabus_threshold
+        remove_mask = remove_mask | outside_syllabus.reshape(-1)
+
+        st.success(f"Questions removed due to syllabus mismatch: {outside_syllabus.sum()}")
+
+    # ==============================
+    # 3️⃣ Final Cleanup
+    # ==============================
+    cleaned_df = gen_df[~remove_mask].reset_index(drop=True)
+
+    st.success(f"Total questions removed: {remove_mask.sum()}")
+    st.subheader("Cleaned Questions Preview")
+    st.dataframe(cleaned_df.head(50))
+
+    # Download
+    buffer = io.BytesIO()
+    cleaned_df.to_excel(buffer, index=False)
+    buffer.seek(0)
+
+    st.download_button(
+        label="Download Cleaned Excel",
+        data=buffer,
+        file_name="cleaned_mcq.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+st.markdown("---")
+st.caption("App uses Sentence Transformers (free open-source embeddings) — zero token cost.")
+ 
